@@ -1,0 +1,691 @@
+// Copyright (c) 2026, the Dart project authors.  Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+/// @docImport 'models/validation_result.dart';
+library;
+
+import 'dart:io';
+
+import 'package:args/args.dart';
+import 'package:logging/logging.dart';
+import 'package:meta/meta.dart';
+
+import 'config_parser.dart';
+import 'missing_defaults_exception.dart';
+import 'models/analysis_severity.dart';
+import 'models/check_type.dart';
+import 'models/custom_rule_parameters.dart';
+import 'models/output_format.dart';
+import 'models/rule_config.dart';
+import 'models/rule_parameter_type.dart';
+import 'models/skill_rule.dart';
+import 'models/validation_target.dart';
+import 'path_utils.dart';
+import 'rule_registry.dart';
+import 'validation_session.dart';
+import 'version.dart';
+
+export 'models/output_format.dart';
+export 'validation_session.dart';
+
+final _log = Logger('skills_lint');
+
+const _printWarningsFlag = 'print-warnings';
+const _fastFailFlag = 'fast-fail';
+const _quietFlag = 'quiet';
+const _skillsDirectoryFlag = 'skills-directory';
+const _skillOption = 'skill';
+const _ignoreFileOption = 'ignore-file';
+const _ignoreConfigFlag = 'ignore-config';
+const _generateBaselineFlag = 'generate-baseline';
+const _fixFlag = 'fix';
+const _dryRunFlag = 'dry-run';
+// TODO(reidbaker): Remove deprecated --fix-apply CLI flag on next major version bump.
+const _fixApplyFlag = 'fix-apply';
+const _allowMisconfiguredKeysFlag = 'allow-misconfigured-keys';
+const _configOption = 'config';
+const _versionFlag = 'version';
+
+const _formatOption = 'format';
+const _formatText = 'text';
+const _formatJson = 'json';
+const _formatSarif = 'sarif';
+
+/// User-visible notice that the `--fix-apply` alias is deprecated.
+///
+/// Exposed (not `_`-prefixed) so integration tests can assert it appears on
+/// stderr when the alias is used.
+const fixApplyDeprecationMsg =
+    '--fix-apply is deprecated; use --fix instead. '
+    'Pass --fix --dry-run to preview changes without writing.';
+
+/// Welcoming first-run guide shown when no args are passed and no default
+/// skills directory exists. Exposed so integration tests can assert the
+/// exact greeting (drift here changes the new-user experience).
+const firstRunGuideMsg = '''
+skills_lint: a linter for Agent Skills (SKILL.md).
+
+No skills were found to validate. Get started in one of three ways:
+
+  1. Lint a single skill directory:
+       dart run skills_lint --skill ./path/to/my-skill
+
+  2. Lint every skill under a root directory:
+       dart run skills_lint --skills-directory ./path/to/skills-root
+
+  3. Drop a skill into one of the auto-discovered default paths
+     (relative to the current directory) and re-run with no flags:
+       .claude/skills/<my-skill>/SKILL.md
+       .agents/skills/<my-skill>/SKILL.md
+
+For repo-wide config, create skills_lint.yaml with a
+`skills_lint.directories` entry.
+
+Spec: https://agentskills.io/specification
+Run with --help to see every flag.''';
+
+/// Configures the root logger to route log events to stdout/stderr.
+void _setupLogger() {
+  Logger.root.level = Level.ALL;
+  Logger.root.onRecord.listen((record) {
+    if (record.level >= Level.WARNING) {
+      stderr.writeln(record.message);
+    } else {
+      stdout.writeln(record.message);
+    }
+  });
+}
+
+/// Validates that auto-fixing flags are not combined with structured machine formats.
+///
+/// Emits a usage error and returns  if an invalid combination is detected.
+bool _hasInvalidFixFormatCombination(
+  ArgResults results,
+  OutputFormat format,
+  ArgParser parser,
+  String formatStr,
+) {
+  final fixFlag = results[_fixFlag] as bool;
+  final fixApplyAlias = results[_fixApplyFlag] as bool;
+  if (hasInvalidFixFormatCombination(fix: fixFlag || fixApplyAlias, format: format)) {
+    _printUsage(
+      parser,
+      'Cannot combine --$_fixFlag with --$_formatOption=$formatStr: '
+      'applying fixes modifies files described by the report.',
+    );
+    return true;
+  }
+  return false;
+}
+
+/// Main entrypoint execution logic for the CLI tool.
+///
+/// Parses arguments and runs validation on the specified directory.
+Future<void> runApp(List<String> args) async {
+  _setupLogger();
+
+  const helpFlag = 'help';
+  final ArgParser parser = _createArgParser(helpFlag);
+
+  final ArgResults results;
+  final Map<String, RuleConfigPatch> resolvedRuleConfigs;
+  final String formatStr;
+  final OutputFormat format;
+
+  try {
+    results = parser.parse(args);
+    formatStr = results[_formatOption] as String? ?? _formatText;
+    format = OutputFormat.fromString(formatStr);
+
+    if (results[_versionFlag] as bool) {
+      stdout.writeln(packageVersion);
+      return;
+    }
+    if (results[helpFlag] as bool) {
+      _printUsage(parser);
+      return;
+    }
+    resolvedRuleConfigs = resolveRuleConfigsFromCli(results);
+  } on FormatException catch (e) {
+    // ArgParserException (a FormatException) for unknown flags or disallowed
+    // values, and FormatException from resolveRuleConfigsFromCli for invalid
+    // rule parameter values.
+    _printUsage(parser, e.toString());
+    exitCode = 64; // Bad usage
+    return;
+  }
+
+  final Configuration? config = await _loadConfig(results, format: format);
+  if (config == null) {
+    exitCode = 1;
+    return;
+  }
+
+  // Do not resolve these paths here. [validateSkillsInternal] anchors them in
+  // one place, so a flag and a programmatic call resolve the same string to
+  // the same directory.
+  final skillDirPaths = results[_skillsDirectoryFlag] as List<String>;
+  final individualSkillPaths = results[_skillOption] as List<String>;
+
+  final printWarnings = results[_printWarningsFlag] as bool;
+  final fastFail = results[_fastFailFlag] as bool;
+  final quiet = results[_quietFlag] as bool;
+  final generateBaseline = results[_generateBaselineFlag] as bool;
+  final fixFlag = results[_fixFlag] as bool;
+  final dryRun = results[_dryRunFlag] as bool;
+  final fixApplyAlias = results[_fixApplyFlag] as bool;
+
+  if (_hasInvalidFixFormatCombination(results, format, parser, formatStr)) {
+    exitCode = 64;
+    return;
+  }
+
+  if (fixApplyAlias) {
+    stderr.writeln(fixApplyDeprecationMsg);
+  }
+
+  // --fix writes fixes to disk; pair with --dry-run to preview without
+  // writing. --fix-apply is a deprecated alias for --fix that still
+  // writes (with a deprecation notice on stderr above).
+  final bool fix = fixFlag && dryRun;
+  final bool fixApply = (fixFlag && !dryRun) || fixApplyAlias;
+
+  final String? ignoreFileOverride = results.wasParsed(_ignoreFileOption)
+      ? results[_ignoreFileOption] as String?
+      : null;
+
+  var success = false;
+  try {
+    success = await validateSkillsInternal(
+      skillDirPaths: skillDirPaths,
+      individualSkillPaths: individualSkillPaths,
+      resolvedRuleConfigs: resolvedRuleConfigs,
+      printWarnings: printWarnings,
+      fastFail: fastFail,
+      quiet: quiet,
+      generateBaseline: generateBaseline,
+      fix: fix,
+      fixApply: fixApply,
+      ignoreFileOverride: ignoreFileOverride,
+      config: config,
+      format: format,
+    );
+    if (success) {
+      exitCode = 0;
+    } else {
+      exitCode = 1;
+    }
+  } on MissingDefaultsException catch (_) {
+    if (format != OutputFormat.text) {
+      stderr.writeln(firstRunGuideMsg);
+    } else {
+      stdout.writeln(firstRunGuideMsg);
+    }
+    exitCode = 64;
+  }
+}
+
+/// Creates the [ArgParser] for the CLI, adding all supported flags and options.
+///
+/// Dynamically adds flags for all registered rules in [RuleRegistry].
+ArgParser _createArgParser(String helpFlag) {
+  final parser = ArgParser()
+    ..addFlag(helpFlag, abbr: 'h', negatable: false, help: 'Show usage information.')
+    ..addFlag(
+      _versionFlag,
+      negatable: false,
+      help: 'Print the skills_lint version and exit. All other flags are ignored.',
+    )
+    ..addFlag(_printWarningsFlag, abbr: 'w', defaultsTo: true, help: 'Print validation warnings.');
+
+  // Dynamically add flags for all registered rules.
+  for (final CheckType check in RuleRegistry.allChecks) {
+    parser.addFlag(
+      check.name,
+      defaultsTo: check.defaultSeverity != AnalysisSeverity.disabled,
+      help: check.help,
+    );
+
+    // Register namespaced delegated parameters
+    for (final String paramName in check.parameterSchema.keys) {
+      final RuleParameterType expectedType = check.parameterSchema[paramName]!;
+      if (expectedType == RuleParameterType.stringList) {
+        parser.addMultiOption(
+          check.parameterFlag(paramName),
+          help: "Override parameter '$paramName' list for rule '${check.name}'.",
+        );
+      } else {
+        parser.addOption(
+          check.parameterFlag(paramName),
+          help: "Override parameter '$paramName' for rule '${check.name}'.",
+        );
+      }
+    }
+  }
+
+  parser
+    ..addFlag(
+      _fastFailFlag,
+      negatable: false,
+      help: 'Fail immediately on the first skill validation error.',
+    )
+    ..addFlag(
+      _quietFlag,
+      abbr: 'q',
+      negatable: false,
+      help: 'Quiet mode (only print errors and warnings).',
+    )
+    ..addMultiOption(
+      _skillsDirectoryFlag,
+      abbr: 'd',
+      help: 'Path to a skills directory to validate. Can be specified multiple times.',
+    )
+    ..addMultiOption(
+      _skillOption,
+      abbr: 's',
+      help: 'Path to an individual skill directory to validate. Can be specified multiple times.',
+    )
+    ..addOption(_ignoreFileOption, help: 'Path to a JSON file listing lints to ignore for the run.')
+    ..addFlag(
+      _generateBaselineFlag,
+      negatable: false,
+      help: 'Write all current errors into $defaultIgnoreFileName to ignore on future runs.',
+    )
+    ..addFlag(
+      _ignoreConfigFlag,
+      negatable: false,
+      help: 'Ignore the YAML configuration file entirely.',
+    )
+    ..addFlag(
+      _fixFlag,
+      negatable: false,
+      help: 'Write fixes for failing lints to disk. Combine with --dry-run to preview.',
+    )
+    ..addFlag(
+      _dryRunFlag,
+      negatable: false,
+      help: 'When passed with --fix, preview proposed changes without writing.',
+    )
+    // help: omitted — flag is hide: true so --help skips it anyway.
+    // Adopters who hit it still get the runtime deprecation notice
+    // on stderr (see fixApplyDeprecationMsg above).
+    ..addFlag(_fixApplyFlag, negatable: false, hide: true)
+    ..addFlag(
+      _allowMisconfiguredKeysFlag,
+      negatable: false,
+      hide: true,
+      help: 'Allow misconfigured keys in skills_lint.yaml.',
+    )
+    ..addOption(
+      _configOption,
+      abbr: 'c',
+      help: 'Path to a custom configuration file (defaults to skills_lint.yaml).',
+    )
+    ..addOption(
+      _formatOption,
+      allowed: [_formatText, _formatJson, _formatSarif],
+      defaultsTo: _formatText,
+      help: 'Specifies the output format for validation diagnostics.',
+      allowedHelp: {
+        _formatText: 'Standard human-readable terminal output.',
+        _formatJson: 'Machine-readable raw JSON array of validation results.',
+        _formatSarif: 'Standard SARIF 2.1.0 JSON document for CI / GitHub Code Scanning.',
+      },
+    );
+
+  return parser;
+}
+
+Future<Configuration?> _loadConfig(
+  ArgResults results, {
+  OutputFormat format = OutputFormat.text,
+}) async {
+  final ignoreConfig = results[_ignoreConfigFlag] as bool;
+  final Configuration config;
+  if (ignoreConfig) {
+    config = const Configuration();
+  } else {
+    try {
+      final configPath = results[_configOption] as String?;
+      config = await ConfigParser.loadConfig(path: configPath);
+    } on FileSystemException catch (e) {
+      _log.severe('Error: ${e.message} (${e.path})');
+      return null;
+    }
+  }
+  if (ignoreConfig && !(results[_quietFlag] as bool) && format == OutputFormat.text) {
+    _log.info('Ignoring configuration file due to $_ignoreConfigFlag flag');
+  }
+
+  if (config.parsingErrors.isNotEmpty) {
+    final allowMisconfiguredKeys = results[_allowMisconfiguredKeysFlag] as bool;
+    if (allowMisconfiguredKeys) {
+      _log.warning(
+        'DEPRECATION WARNING: --allow-misconfigured-keys is deprecated and will be removed in a future release. Fix misconfigured configuration keys rather than bypassing validation.',
+      );
+      for (final String error in config.parsingErrors) {
+        _log.warning('Configuration warning: $error');
+      }
+    } else {
+      for (final String error in config.parsingErrors) {
+        _log.severe('Configuration error: $error');
+      }
+      _log.severe('Use --$_allowMisconfiguredKeysFlag to ignore these errors.');
+      return null;
+    }
+  }
+  return config;
+}
+
+/// Validates skills based on the provided configuration.
+///
+/// This is the public entrypoint for executing skill validation and emitting
+/// formatted diagnostic output. When [format] is set to [OutputFormat.sarif] or
+/// [OutputFormat.json], structured output is written directly to standard output.
+///
+/// Callers who need access to validation output without console emission should
+/// instantiate [ValidationSession] directly and query [ValidationSession.results]
+/// for the structured [ValidationResult]s, or [ValidationSession.toSarifJson] and
+/// [ValidationSession.toJsonOutput] for the serialized forms.
+///
+/// [skillDirPaths] is a list of directories containing multiple skills.
+/// [individualSkillPaths] is a list of paths to individual skill directories.
+/// [resolvedRules] is a map of rule names to their severity overrides.
+/// [printWarnings] controls whether to print validation warnings.
+/// [fastFail] causes validation to stop on the first error.
+/// [quiet] suppresses non-error/warning output.
+/// [generateBaseline] writes current errors to a baseline file instead of reporting them.
+/// [ignoreFileOverride] is an optional path to a baseline file to use.
+/// [config] is the loaded configuration.
+/// [customRules] contains programmatically injected custom skill rule checks.
+/// [format] specifies the output format for diagnostics (`text`, `json`, `sarif`).
+///
+/// Returns a [Future] that resolves to `true` if all skills validated successfully
+/// (or if [generateBaseline] is true), and `false` if any validation failures
+/// were encountered.
+Future<bool> validateSkills({
+  List<String> skillDirPaths = const [],
+  List<String> individualSkillPaths = const [],
+  @Deprecated('Use resolvedRuleConfigs instead')
+  Map<String, AnalysisSeverity> resolvedRules = const {},
+  Map<String, RuleConfigPatch> resolvedRuleConfigs = const {},
+  bool printWarnings = true,
+  bool fastFail = false,
+  bool quiet = false,
+  bool generateBaseline = false,
+  String? ignoreFileOverride,
+  Configuration? config,
+  List<SkillRule> customRules = const [],
+  OutputFormat format = OutputFormat.text,
+}) {
+  return validateSkillsInternal(
+    skillDirPaths: skillDirPaths,
+    individualSkillPaths: individualSkillPaths,
+    resolvedRuleConfigs: ValidationSession.mergeDeprecatedRules(resolvedRules, resolvedRuleConfigs),
+    printWarnings: printWarnings,
+    fastFail: fastFail,
+    quiet: quiet,
+    generateBaseline: generateBaseline,
+    ignoreFileOverride: ignoreFileOverride,
+    config: config,
+    customRules: customRules,
+    format: format,
+  );
+}
+
+/// Internal implementation of skill validation that supports fixing.
+///
+/// Kept internal to avoid exposing experimental fix parameters in the public API.
+///
+/// Returns `true` if all validations passed (or if generating a baseline), `false` otherwise.
+@visibleForTesting
+Future<bool> validateSkillsInternal({
+  List<String> skillDirPaths = const [],
+  List<String> individualSkillPaths = const [],
+  Map<String, RuleConfigPatch> resolvedRuleConfigs = const {},
+  bool printWarnings = true,
+  bool fastFail = false,
+  bool quiet = false,
+  bool generateBaseline = false,
+  bool fix = false,
+  // TODO(reidbaker): Remove deprecated fixApply parameter on next major version bump.
+  bool fixApply = false,
+  String? ignoreFileOverride,
+  Configuration? config,
+  List<SkillRule> customRules = const [],
+  OutputFormat format = OutputFormat.text,
+}) async {
+  if (hasInvalidFixFormatCombination(fix: fix || fixApply, format: format)) {
+    throw ArgumentError(
+      'Cannot combine fixing with output format "${format.name}". '
+      'Applying fixes modifies files described by the report.',
+    );
+  }
+
+  // The CLI and API boundary: everything below this point works with absolute,
+  // normalized paths. See [canonicalizePath] for the boundary contract.
+  final String workingDirectory = Directory.current.path;
+  final List<String> canonicalIndividualSkillPaths = canonicalizePaths(
+    individualSkillPaths,
+    baseDirectory: workingDirectory,
+  );
+  final List<String> canonicalSkillDirPaths = canonicalizePaths(
+    skillDirPaths,
+    baseDirectory: workingDirectory,
+  );
+  final String? canonicalIgnoreFileOverride = canonicalizePathOrNull(
+    ignoreFileOverride,
+    baseDirectory: workingDirectory,
+  );
+
+  final bool hasCliTargets =
+      canonicalSkillDirPaths.isNotEmpty || canonicalIndividualSkillPaths.isNotEmpty;
+  final List<ValidationTarget> effectiveIndividualSkills = [
+    ..._commandLineTargets(individualSkillPaths, canonicalIndividualSkillPaths),
+    if (config != null && !hasCliTargets)
+      for (final LintTargetConfig target in config.individualSkillConfigs)
+        ValidationTarget.fromConfiguration(target),
+  ];
+
+  final List<ValidationTarget> effectiveSkillDirs = _getEffectiveSkillDirs(
+    skillDirs: _commandLineTargets(skillDirPaths, canonicalSkillDirPaths),
+    individualSkillPaths: canonicalIndividualSkillPaths,
+    config: config,
+    workingDirectory: workingDirectory,
+  );
+
+  final session = ValidationSession(
+    config: config ?? const Configuration(),
+    resolvedRuleConfigs: resolvedRuleConfigs,
+    ignoreFileOverride: canonicalIgnoreFileOverride,
+    customRules: customRules,
+    printWarnings: printWarnings,
+    fastFail: fastFail,
+    quiet: quiet,
+    generateBaseline: generateBaseline,
+    fix: fix,
+    fixApply: fixApply,
+    format: format,
+  );
+
+  for (final skill in effectiveIndividualSkills) {
+    final bool keepGoing = await session.processIndividualSkill(
+      skill.path,
+      declaredBy: skill.declaredBy,
+      cliText: skill.cliText,
+    );
+    if (!keepGoing) {
+      break;
+    }
+  }
+  if (session.anyFailed && fastFail) {
+    if (format != OutputFormat.text) {
+      session.emitFormattedOutput();
+    }
+    return false;
+  }
+
+  for (final root in effectiveSkillDirs) {
+    final bool keepGoing = await session.processSkillRoot(
+      root.path,
+      declaredBy: root.declaredBy,
+      cliText: root.cliText,
+    );
+    if (!keepGoing) {
+      break;
+    }
+  }
+
+  session.reportNoSkillsValidated([for (final root in effectiveSkillDirs) root.path]);
+
+  if (format != OutputFormat.text) {
+    session.emitFormattedOutput();
+  }
+
+  if (generateBaseline) {
+    return true;
+  }
+  return !session.anyFailed;
+}
+
+/// Pairs each of [canonicalPaths] with the [rawPaths] entry it came from.
+List<ValidationTarget> _commandLineTargets(List<String> rawPaths, List<String> canonicalPaths) => [
+  for (final (int i, String path) in canonicalPaths.indexed)
+    ValidationTarget.fromCommandLine(path, typed: rawPaths[i]),
+];
+
+/// Computes the list of skill directories to validate.
+///
+/// If [skillDirs] is empty, falls back to configured directories, and then to
+/// default locations (`.claude/skills`, `.agents/skills`) resolved against
+/// [workingDirectory].
+/// Throws [MissingDefaultsException] if no directories are found.
+List<ValidationTarget> _getEffectiveSkillDirs({
+  required List<ValidationTarget> skillDirs,
+  required List<String> individualSkillPaths,
+  required String workingDirectory,
+  Configuration? config,
+}) {
+  final effectiveSkillDirs = List<ValidationTarget>.from(skillDirs);
+
+  if (effectiveSkillDirs.isEmpty && individualSkillPaths.isEmpty) {
+    // If the config specifies any targets (even if it's only individual_skills
+    // and directories is empty), we avoid the default directory fallback.
+    if (config != null &&
+        (config.directoryConfigs.isNotEmpty || config.individualSkillConfigs.isNotEmpty)) {
+      return [
+        for (final LintTargetConfig target in config.directoryConfigs)
+          ValidationTarget.fromConfiguration(target),
+      ];
+    } else {
+      const defaults = ['.claude/skills', '.agents/skills'];
+      final List<String> existingDefaults = canonicalizePaths(
+        defaults,
+        baseDirectory: workingDirectory,
+      ).where((String path) => Directory(path).existsSync()).toList();
+      if (existingDefaults.isEmpty) {
+        throw MissingDefaultsException(defaults);
+      }
+      return [for (final String path in existingDefaults) ValidationTarget.byDefault(path)];
+    }
+  }
+
+  return effectiveSkillDirs;
+}
+
+@visibleForTesting
+Map<String, RuleConfigPatch> resolveRuleConfigsFromCli(ArgResults results) {
+  final configs = <String, RuleConfigPatch>{};
+
+  // 1. Resolve severities from CLI flags (e.g. --path-does-not-exist)
+  final severityOverrides = <String, AnalysisSeverity>{};
+  for (final CheckType check in RuleRegistry.allChecks) {
+    final String name = check.name;
+    if (results.options.contains(name) && results.wasParsed(name)) {
+      final Object? value = results[name];
+      if (value is bool) {
+        severityOverrides[name] = value ? AnalysisSeverity.error : AnalysisSeverity.disabled;
+      }
+    }
+  }
+
+  // 2. Resolve parameter overrides from CLI flags (e.g. --path-does-not-exist-exclude)
+  final parameterOverrides = <String, Map<String, Object?>>{};
+  for (final CheckType check in RuleRegistry.allChecks) {
+    final Map<String, Object?> checkOverrides = _resolveParametersForCheck(check, results);
+    if (checkOverrides.isNotEmpty) {
+      parameterOverrides[check.name] = checkOverrides;
+    }
+  }
+
+  // 3. Combine into RuleConfigPatch overrides
+  final Set<String> allRuleNames = {...severityOverrides.keys, ...parameterOverrides.keys};
+  for (final ruleName in allRuleNames) {
+    configs[ruleName] = RuleConfigPatch(
+      severity: severityOverrides[ruleName],
+      parameters: parameterOverrides.containsKey(ruleName)
+          ? CustomRuleParameters(parameterOverrides[ruleName])
+          : null,
+    );
+  }
+
+  return configs;
+}
+
+Map<String, Object?> _resolveParametersForCheck(CheckType check, ArgResults results) {
+  final checkOverrides = <String, Object?>{};
+  for (final String paramName in check.parameterSchema.keys) {
+    final String paramFlag = check.parameterFlag(paramName);
+    if (results.options.contains(paramFlag) && results.wasParsed(paramFlag)) {
+      final RuleParameterType expectedType = check.parameterSchema[paramName]!;
+      checkOverrides[paramName] = _parseParameterValue(paramFlag, results[paramFlag], expectedType);
+    }
+  }
+  final List<String> errors = check.validateConstrainedParameters(
+    CustomRuleParameters(checkOverrides),
+  );
+  if (errors.isNotEmpty) {
+    throw FormatException(errors.join('\n'));
+  }
+  return checkOverrides;
+}
+
+Object? _parseParameterValue(String paramFlag, Object? rawValue, RuleParameterType expectedType) {
+  if (rawValue == '') {
+    return null;
+  }
+
+  if (expectedType == RuleParameterType.integer) {
+    final int? parsedInt = int.tryParse(rawValue.toString());
+    if (parsedInt == null) {
+      throw FormatException(
+        'Invalid value "$rawValue" for parameter "$paramFlag". Expected an integer.',
+      );
+    }
+    return parsedInt;
+  }
+
+  if (expectedType == RuleParameterType.boolean) {
+    final String lower = rawValue.toString().toLowerCase();
+    if (lower != 'true' && lower != 'false') {
+      throw FormatException(
+        'Invalid value "$rawValue" for parameter "$paramFlag". Expected "true" or "false".',
+      );
+    }
+    return lower == 'true';
+  }
+
+  return rawValue;
+}
+
+void _printUsage(ArgParser parser, [String? error]) {
+  if (error != null) {
+    stderr.writeln('Error: $error');
+    stderr.writeln('Usage: skills_lint [options] --$_skillsDirectoryFlag <$_skillsDirectoryFlag>');
+    stderr.writeln(parser.usage);
+  } else {
+    stdout.writeln('Usage: skills_lint [options] --$_skillsDirectoryFlag <$_skillsDirectoryFlag>');
+    stdout.writeln(parser.usage);
+  }
+}

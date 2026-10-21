@@ -1,0 +1,73 @@
+---
+name: skills-lint-setup
+description: |-
+  Use this skill to initialize and configure skills_lint in a Dart project.
+  Covers adding skills_lint to pubspec.yaml dev_dependencies, creating root skills_lint.yaml, generating baseline ignore files for legacy skills, and configuring CI workflows or pre-commit hooks.
+---
+
+# Setting up Skill Validation with skills_lint
+
+This skill covers **first-time wiring** of `skills_lint` into a
+repository. For ongoing use — running the linter, interpreting
+output, and writing custom rules — see the
+[`skills-lint-validation`](../skills-lint-validation/SKILL.md)
+skill. For copy-pasteable CI workflow and pre-commit hook recipes,
+see the [`Recipes` section of the README](../../../../README.md#recipes).
+
+## Steps
+
+1. **Add `skills_lint` as a `dev_dependency`.**
+
+   ```yaml
+   dev_dependencies:
+     skills_lint: ^0.5.0
+   ```
+
+   **Isolate the dependency** in a `tool/` package when you can,
+   instead of putting it on the root `pubspec.yaml` — keeps the
+   linter's deps out of your runtime closure. If you must add it
+   to multiple `pubspec.yaml` files, ensure the `ref:` (commit
+   hash) is identical across all of them so resolution doesn't
+   diverge.
+
+2. **Create `skills_lint.yaml`** at the repository root so both
+   the CLI and any embedded test invocation share the same config:
+
+   ```yaml
+   skills_lint:
+     rules:
+       check-relative-paths: error
+       check-trailing-whitespace: error
+     directories:
+       - path: ".agents/skills"
+   ```
+
+   Rules enabled by default — `check-absolute-paths`,
+   `valid-yaml-metadata`, `invalid-skill-name`,
+   `description-too-long` — only need to be listed if you want to
+   change their severity or parameters (for example,
+   `description-too-long: { severity: error, max-length: 500 }`
+   lowers the description limit from the default 1024 characters). See
+   [`RULES.md`](../../RULES.md) for the full list.
+
+3. **Generate a baseline** if you're integrating into a repository
+   with pre-existing skills that have legacy violations you don't
+   want to fix immediately:
+
+   ```bash
+   dart run skills_lint --skills-directory=.agents/skills --generate-baseline
+   ```
+
+   This writes the current set of failures into an ignore file so
+   the next run exits clean. New violations introduced after the
+   baseline still surface as errors.
+
+4. **Wire it into CI.** Use the
+   [GitHub Actions recipe](../../../../README.md#recipes) from the README
+   verbatim, or follow the
+   [pre-commit hook recipe](../../../../README.md#recipes) below it.
+
+## When you're done
+
+The skills-lint-validation skill takes over from here for
+day-to-day use.

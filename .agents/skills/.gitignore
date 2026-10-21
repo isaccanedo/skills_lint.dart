@@ -1,0 +1,4 @@
+*.log
+# Ignore skills under evaluation.
+skill-creator
+

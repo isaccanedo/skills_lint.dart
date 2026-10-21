@@ -1,0 +1,12 @@
+# Development, benchmarking, and internal tooling
+/benchmark/
+/test/benchmark/
+/documentation/
+/evals/
+/scripts/
+/skills/
+/.agents/
+/coverage/
+/example/api_boundary_runner/
+/repo_test/
+/compiled_test/

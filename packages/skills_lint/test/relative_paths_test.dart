@@ -1,0 +1,349 @@
+// Copyright (c) 2026, the Dart project authors.  Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
+import 'package:skills_lint/src/models/analysis_severity.dart';
+import 'package:skills_lint/src/models/rule_config.dart';
+import 'package:skills_lint/src/models/skill_context.dart';
+import 'package:skills_lint/src/models/validation_error.dart';
+import 'package:skills_lint/src/rules/absolute_paths_rule.dart';
+import 'package:skills_lint/src/rules/relative_paths_rule.dart';
+import 'package:skills_lint/src/validator.dart';
+import 'package:test/test.dart';
+
+import 'test_utils.dart';
+
+void main() {
+  group('Relative Paths Validation', () {
+    late Directory tempDir;
+
+    setUp(() async {
+      tempDir = await Directory.systemTemp.createTemp('paths_test.');
+    });
+
+    tearDown(() async {
+      if (tempDir.existsSync()) {
+        await tempDir.delete(recursive: true);
+      }
+    });
+
+    test('passes with valid relative file path (existing file)', () async {
+      final Directory skillDir = await Directory('${tempDir.path}/test-skill').create();
+      await File('${skillDir.path}/SKILL.md').writeAsString(
+        '${buildFrontmatter(name: 'test-skill')}[Link to a reference](references/DETAILS.md)\n',
+      );
+
+      final Directory refDir = await Directory('${skillDir.path}/references').create();
+      await File('${refDir.path}/DETAILS.md').writeAsString('Details here');
+
+      final validator = Validator(
+        ruleConfigs: {
+          RelativePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.warning),
+        },
+      );
+      final ValidationResult result = await validator.validate(skillDir);
+
+      expect(result.isValid, isTrue);
+      expect(result.errors, isEmpty);
+      expect(result.warnings, isEmpty);
+    });
+
+    test('warns with missing relative file path and reports resolved path', () async {
+      final Directory skillDir = await Directory('${tempDir.path}/test-skill').create();
+      await File('${skillDir.path}/SKILL.md').writeAsString(
+        '${buildFrontmatter(name: 'test-skill')}[Link to a references file missing](references/MISSING.md)\n',
+      );
+
+      final validator = Validator(
+        ruleConfigs: {
+          RelativePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.warning),
+        },
+      );
+      final ValidationResult result = await validator.validate(skillDir);
+
+      expect(result.isValid, isTrue);
+      expect(result.warnings, contains(contains('Linked file does not exist')));
+      expect(result.warnings, contains(contains('references/MISSING.md')));
+      // The diagnostic includes the resolved absolute path. The exact
+      // shape differs by platform (POSIX `/...` vs Windows `C:\...`),
+      // so just assert the prefix and that what follows is absolute.
+      final String warning = result.warnings.firstWhere((w) => w.contains('resolved to '));
+      final int prefixIdx = warning.indexOf('resolved to ');
+      final String resolved = warning.substring(prefixIdx + 'resolved to '.length);
+      expect(p.isAbsolute(resolved), isTrue, reason: 'resolved path "$resolved" is not absolute');
+    });
+
+    test('checks a link that is not a valid URI as a file path', () async {
+      final Directory skillDir = await Directory('${tempDir.path}/test-skill').create();
+      // Uri.parse rejects "1a:b.md" (a scheme must start with a letter).
+      await File(
+        '${skillDir.path}/SKILL.md',
+      ).writeAsString('${buildFrontmatter(name: 'test-skill')}[Odd link](1a:b.md)\n');
+
+      final validator = Validator(
+        ruleConfigs: {
+          RelativePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.warning),
+        },
+      );
+      final ValidationResult result = await validator.validate(skillDir);
+
+      expect(result.warnings, contains(contains('Linked file does not exist')));
+      expect(result.warnings, contains(contains('1a:b.md')));
+    });
+
+    test('did-you-mean: suggests near-miss sibling file when one exists', () async {
+      final Directory skillDir = await Directory('${tempDir.path}/test-skill').create();
+      await File(
+        '${skillDir.path}/SKILL.md',
+      ).writeAsString('${buildFrontmatter(name: 'test-skill')}[Link](references/DEATILS.md)\n');
+      final Directory refs = await Directory('${skillDir.path}/references').create();
+      await File('${refs.path}/DETAILS.md').writeAsString('Details');
+
+      final validator = Validator(
+        ruleConfigs: {
+          RelativePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.warning),
+        },
+      );
+      final ValidationResult result = await validator.validate(skillDir);
+      expect(result.isValid, isTrue);
+      // Suggestion preserves the link's directory prefix so the user
+      // gets back a copy-pasteable replacement, not just a basename.
+      expect(result.warnings, contains(contains('Did you mean "references/DETAILS.md"?')));
+    });
+
+    test('did-you-mean: stays silent when nothing in the sibling dir is close', () async {
+      final Directory skillDir = await Directory('${tempDir.path}/test-skill').create();
+      await File(
+        '${skillDir.path}/SKILL.md',
+      ).writeAsString('${buildFrontmatter(name: 'test-skill')}[Link](references/MISSING.md)\n');
+      final Directory refs = await Directory('${skillDir.path}/references').create();
+      await File('${refs.path}/UNRELATED.txt').writeAsString('Nope');
+
+      final validator = Validator(
+        ruleConfigs: {
+          RelativePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.warning),
+        },
+      );
+      final ValidationResult result = await validator.validate(skillDir);
+      expect(result.isValid, isTrue);
+      expect(result.warnings, contains(contains('Linked file does not exist')));
+      expect(result.warnings.any((w) => w.contains('Did you mean')), isFalse);
+    });
+
+    test('fails with absolute file path', () async {
+      final Directory skillDir = await Directory('${tempDir.path}/test-skill').create();
+      await File('${skillDir.path}/SKILL.md').writeAsString(
+        '${buildFrontmatter(name: 'test-skill')}[Absolute path link](/tmp/some_absolute_path/file.md)\n',
+      );
+
+      final validator = Validator(
+        ruleConfigs: {
+          RelativePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.warning),
+          AbsolutePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.error),
+        },
+      );
+      final ValidationResult result = await validator.validate(skillDir);
+
+      expect(result.isValid, isFalse);
+      expect(result.errors, contains(contains('Absolute filepath found in link')));
+    });
+
+    test('ignores web URLs, emails, javascript, data URIs, and anchors', () async {
+      final Directory skillDir = await Directory('${tempDir.path}/test-skill').create();
+      await File('${skillDir.path}/SKILL.md').writeAsString(
+        '${buildFrontmatter(name: 'test-skill')}- [Web link](http://example.com)\n- [Web TLS link](https://example.com)\n- [Email link](mailto:user@domain.com)\n- [JS link](javascript:alert(1))\n- [Data URI](data:image/png;base64,iVBORw)\n- [Anchor link](#section-name)\n',
+      );
+
+      final validator = Validator(
+        ruleConfigs: {
+          RelativePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.warning),
+        },
+      );
+      final ValidationResult result = await validator.validate(skillDir);
+
+      expect(result.isValid, isTrue);
+      expect(result.errors, isEmpty);
+      expect(result.warnings, isEmpty); // None of these should trigger local file checks
+    });
+
+    test('passes with valid relative image path and title', () async {
+      final Directory skillDir = await Directory('${tempDir.path}/test-skill').create();
+      await File('${skillDir.path}/SKILL.md').writeAsString(
+        '${buildFrontmatter(name: 'test-skill')}![Accessible description](images/screenshot.png "Hover description")\n',
+      );
+
+      final Directory imgDir = await Directory('${skillDir.path}/images').create();
+      await File('${imgDir.path}/screenshot.png').writeAsString('image content');
+
+      final validator = Validator(
+        ruleConfigs: {
+          RelativePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.warning),
+        },
+      );
+      final ValidationResult result = await validator.validate(skillDir);
+
+      expect(result.isValid, isTrue);
+      expect(result.errors, isEmpty);
+      expect(result.warnings, isEmpty);
+    });
+
+    test('passes with relative path containing line fragments', () async {
+      final Directory skillDir = await Directory(
+        '${tempDir.path}/a/b/c/test-skill',
+      ).create(recursive: true);
+      await File('${skillDir.path}/SKILL.md').writeAsString(
+        '${buildFrontmatter(name: 'test-skill')}[Link to lines](../../../CONTRIBUTING.md#L64-L80)\n',
+      );
+
+      await File('${tempDir.path}/a/CONTRIBUTING.md').create(recursive: true);
+
+      final validator = Validator(
+        ruleConfigs: {
+          RelativePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.warning),
+        },
+      );
+      final ValidationResult result = await validator.validate(skillDir);
+
+      expect(result.isValid, isTrue);
+      expect(result.errors, isEmpty);
+      expect(result.warnings, isEmpty);
+    });
+
+    test('passes with relative path containing anchor fragments', () async {
+      final Directory skillDir = await Directory('${tempDir.path}/test-skill').create();
+      await File('${skillDir.path}/SKILL.md').writeAsString(
+        '${buildFrontmatter(name: 'test-skill')}[Link to section](styleguide.md#miscellaneous-languages)\n',
+      );
+
+      await File('${skillDir.path}/styleguide.md').writeAsString('Styleguide content');
+
+      final validator = Validator(
+        ruleConfigs: {
+          RelativePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.warning),
+        },
+      );
+      final ValidationResult result = await validator.validate(skillDir);
+
+      expect(result.isValid, isTrue);
+      expect(result.errors, isEmpty);
+      expect(result.warnings, isEmpty);
+    });
+
+    test('passes with leading and trailing whitespace in link', () async {
+      final Directory skillDir = await Directory('${tempDir.path}/test-skill').create();
+      await File('${skillDir.path}/SKILL.md').writeAsString(
+        '${buildFrontmatter(name: 'test-skill')}[Link with whitespace]( styleguide.md )\n',
+      );
+
+      await File('${skillDir.path}/styleguide.md').writeAsString('Styleguide content');
+
+      final validator = Validator(
+        ruleConfigs: {
+          RelativePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.warning),
+        },
+      );
+      final ValidationResult result = await validator.validate(skillDir);
+
+      expect(result.isValid, isTrue);
+      expect(result.errors, isEmpty);
+      expect(result.warnings, isEmpty);
+    });
+
+    test('reports accurate 1-based line number for missing relative link', () async {
+      final Directory skillDir = await Directory('${tempDir.path}/test-skill').create();
+      await File('${skillDir.path}/SKILL.md').writeAsString(
+        '---\n'
+        'name: test-skill\n'
+        'description: A test skill\n'
+        '---\n'
+        '\n'
+        'Some content on line 6\n'
+        'Line 7 has [missing link](docs/MISSING.md).\n',
+      );
+
+      final rule = RelativePathsRule(severity: AnalysisSeverity.error);
+      final file = File('${skillDir.path}/SKILL.md');
+      final String raw = await file.readAsString();
+      final context = SkillContext(directory: skillDir, rawContent: raw);
+
+      final List<ValidationError> errors = await rule.validate(context);
+      expect(errors.length, equals(1));
+      expect(errors.first.ruleId, equals('check-relative-paths'));
+      expect(errors.first.region?.startLine, equals(7));
+    });
+
+    group('percent-encoded links', () {
+      Future<ValidationResult> validateLink(String link, {String? existingFile}) async {
+        final Directory skillDir = await createDummySkill(
+          tempDir,
+          name: 'test-skill',
+          skillContent: '${buildFrontmatter(name: 'test-skill')}[doc]($link)\n',
+        );
+        if (existingFile != null) {
+          final file = File(p.join(skillDir.path, existingFile));
+          await file.parent.create(recursive: true);
+          await file.writeAsString('doc');
+        }
+        final validator = Validator(
+          ruleConfigs: {
+            RelativePathsRule.ruleName: const RuleConfig(severity: AnalysisSeverity.error),
+          },
+        );
+        return validator.validate(skillDir);
+      }
+
+      test('finds a file whose name has an encoded space', () async {
+        final ValidationResult result = await validateLink(
+          'my%20file.md',
+          existingFile: 'my file.md',
+        );
+        expect(result.errors, isEmpty);
+      });
+
+      test('finds a file whose name has encoded unicode', () async {
+        final ValidationResult result = await validateLink('caf%C3%A9.md', existingFile: 'café.md');
+        expect(result.errors, isEmpty);
+      });
+
+      test('finds a file whose name has an encoded #', () async {
+        final ValidationResult result = await validateLink('a%23b.md', existingFile: 'a#b.md');
+        expect(result.errors, isEmpty);
+      });
+
+      test('finds a nested file for an encoded slash', () async {
+        final ValidationResult result = await validateLink(
+          'a%2Fb.md',
+          existingFile: p.join('a', 'b.md'),
+        );
+        expect(result.errors, isEmpty);
+      });
+
+      test('resolves a link with a malformed escape as written', () async {
+        final ValidationResult result = await validateLink('bad%zz.md', existingFile: 'bad%zz.md');
+        expect(result.errors, isEmpty);
+      });
+
+      test('reports a link whose escape is not valid UTF-8 as missing', () async {
+        final ValidationResult result = await validateLink('x%E9.md');
+        expect(result.errors, [contains('Linked file does not exist: x%E9.md')]);
+      });
+
+      test('reports a link that decodes to an absolute path as missing', () async {
+        final String target = p.join(tempDir.path, 'outside.md');
+        await File(target).writeAsString('doc');
+
+        final ValidationResult result = await validateLink(Uri.encodeComponent(target));
+
+        expect(result.errors, [contains('Linked file does not exist')]);
+      });
+
+      test('reports a link with an encoded NUL as missing', () async {
+        final ValidationResult result = await validateLink('a.md%00b', existingFile: 'a.md');
+        expect(result.errors, [contains('Linked file does not exist: a.md%00b')]);
+      });
+    });
+  });
+}

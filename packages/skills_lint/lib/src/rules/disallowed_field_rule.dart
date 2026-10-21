@@ -1,0 +1,78 @@
+// Copyright (c) 2026, the Dart project authors.  Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+import 'package:yaml/yaml.dart';
+import '../models/analysis_severity.dart';
+import '../models/skill_context.dart';
+import '../models/skill_rule.dart';
+import '../models/source_region.dart';
+import '../models/validation_error.dart';
+import '../specification_urls.dart';
+
+/// Enforces that only allowed fields are present in YAML metadata.
+class DisallowedFieldRule extends SkillRule {
+  DisallowedFieldRule({this.severity = defaultSeverity});
+
+  static const String ruleName = 'disallowed-field';
+  static const AnalysisSeverity defaultSeverity = AnalysisSeverity.disabled;
+
+  @override
+  String get name => ruleName;
+
+  @override
+  final AnalysisSeverity severity;
+
+  static const _allowedFields = {
+    'name',
+    'description',
+    'license',
+    'allowed-tools',
+    'metadata',
+    'compatibility',
+    'category',
+    'tags',
+    'version',
+    'eval_task',
+  };
+
+  static const _skillFileName = 'SKILL.md';
+
+  @override
+  Future<List<ValidationError>> validate(SkillContext context) async {
+    final errors = <ValidationError>[];
+
+    if (context.parsedYaml == null) {
+      return errors;
+    }
+
+    final YamlMap yaml = context.parsedYaml!;
+    for (final MapEntry<Object?, YamlNode> entry in yaml.nodes.entries) {
+      final Object? keyObj = entry.key;
+      final String keyStr = keyObj is YamlScalar
+          ? keyObj.value?.toString() ?? ''
+          : keyObj?.toString() ?? '';
+      final bool isDisallowed = !_allowedFields.contains(keyStr);
+      if (isDisallowed) {
+        final YamlNode keyNode = keyObj is YamlNode ? keyObj : entry.value;
+        final SourceRegion? region = context.yamlNodeToRegion(keyNode);
+        errors.add(
+          ValidationError(
+            ruleId: name,
+            severity: severity,
+            file: _skillFileName,
+            message: 'Disallowed field: $keyStr (see ${SpecificationUrls.frontmatter})',
+            markdownMessage:
+                '**Disallowed frontmatter field:** `$keyStr`\n\n'
+                '**How to fix:**\n'
+                '- Remove `$keyStr` from frontmatter, or move it under `metadata:` if it is custom tool configuration.\n\n'
+                '*(See [Agent Skills Specification - Frontmatter](${SpecificationUrls.frontmatter}))*',
+            region: region,
+          ),
+        );
+      }
+    }
+
+    return errors;
+  }
+}
